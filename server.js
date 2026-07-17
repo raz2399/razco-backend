@@ -15,7 +15,10 @@ const path     = require('path');
 const app = express();
 app.use(cors({ origin:'*', methods:['GET','POST','PUT','DELETE','OPTIONS'], allowedHeaders:['Content-Type','Authorization'] }));
 app.options('*', cors());
-app.use(express.json({ limit:'50mb' }));
+
+// FIX 1: 100mb payload limit for base64 images
+app.use(express.json({ limit:'100mb' }));
+app.use(express.urlencoded({ limit:'100mb', extended:true }));
 
 // ── ENV ──────────────────────────────────────────────────────
 const PORT          = process.env.PORT || 3000;
@@ -145,10 +148,20 @@ function getTier(points) {
   return 'Bronze';
 }
 
+// FIX 2: cleanPhone helper — always store and send as 10 digits, format for Twilio with +1
+function normalizePhone(raw) {
+  return (raw || '').replace(/\D/g, '').slice(-10);
+}
+function twilioPhone(tenDigit) {
+  return '+1' + tenDigit;
+}
+
 async function sendSMS(to, body) {
   if (!twilioClient) return { success: false, error: 'Twilio not configured' };
   try {
-    const msg = await twilioClient.messages.create({ from: TWILIO_PHONE, to, body });
+    // to should already be +1XXXXXXXXXX
+    const formatted = to.startsWith('+') ? to : '+1' + to.replace(/\D/g,'').slice(-10);
+    const msg = await twilioClient.messages.create({ from: TWILIO_PHONE, to: formatted, body });
     return { success: true, sid: msg.sid };
   } catch (e) {
     return { success: false, error: e.message };
@@ -179,33 +192,45 @@ app.get('/api/customers', (req, res) => {
 app.post('/api/customers/signup', (req, res) => {
   const { name, phone, email, opt_in_sms, birthday } = req.body;
   if (!name || !phone) return res.status(400).json({ success: false, error: 'Name and phone required' });
-  const cleanPhone = phone.replace(/\D/g, '');
+
+  // FIX 2: normalize to 10 digits for storage
+  const cleanPhone = normalizePhone(phone);
+  if (cleanPhone.length !== 10) return res.status(400).json({ success: false, error: 'Invalid phone number' });
+
   const existing = db.prepare('SELECT * FROM customers WHERE phone=?').get(cleanPhone);
   if (existing) return res.json({ success: false, error: 'Phone already registered', customer: existing });
-  const result = db.prepare('INSERT INTO customers (name,phone,email,opt_in_sms,points,visits,tier,birthday,last_visit) VALUES (?,?,?,?,50,1,?,?,datetime("now"))').run(name, cleanPhone, email||'', opt_in_sms?1:0, 'Bronze', birthday||'');
+
+  const result = db.prepare('INSERT INTO customers (name,phone,email,opt_in_sms,points,visits,tier,birthday,last_visit) VALUES (?,?,?,?,50,1,?,?,datetime("now"))').run(
+    name, cleanPhone, email||'', opt_in_sms?1:0, 'Bronze', birthday||''
+  );
   const customer = db.prepare('SELECT * FROM customers WHERE id=?').get(result.lastInsertRowid);
+
   // Assign to active punch cards
   const activePCs = db.prepare('SELECT * FROM punch_cards WHERE active=1').all();
   activePCs.forEach(pc => {
     db.prepare('INSERT INTO customer_punches (customer_id, punch_card_id, punches) VALUES (?,?,0)').run(customer.id, pc.id);
   });
+
   // Welcome SMS
   if (opt_in_sms && twilioClient) {
     const msg = `¡Bienvenido ${name}! You've joined Razco Foods Rewards 🎉 You have 50 bonus points. Show this text at checkout for your FREE spin prize! Reply STOP to unsubscribe.`;
-    sendSMS('+1'+cleanPhone, msg);
+    sendSMS(twilioPhone(cleanPhone), msg);
   }
+
   res.json({ success: true, customer, message: 'Welcome to Razco Rewards!' });
 });
 
 app.post('/api/customers/checkin', (req, res) => {
   const { phone } = req.body;
   if (!phone) return res.status(400).json({ success: false, error: 'Phone required' });
-  const cleanPhone = phone.replace(/\D/g, '');
+
+  // FIX 2: normalize to 10 digits
+  const cleanPhone = normalizePhone(phone);
   const customer = db.prepare('SELECT * FROM customers WHERE phone=?').get(cleanPhone);
   if (!customer) return res.json({ success: false, error: 'Customer not found' });
-  // Add points and visit
+
   db.prepare('UPDATE customers SET visits=visits+1, points=points+10, tier=?, last_visit=datetime("now") WHERE id=?').run(getTier(customer.points+10), customer.id);
-  // Update punch cards
+
   const activePCs = db.prepare('SELECT * FROM punch_cards WHERE active=1').all();
   const punchResults = [];
   activePCs.forEach(pc => {
@@ -215,12 +240,13 @@ app.post('/api/customers/checkin', (req, res) => {
     const earned = newPunches >= pc.visits_required;
     if (earned) {
       db.prepare('UPDATE customer_punches SET punches=0, redeemed=redeemed+1 WHERE customer_id=? AND punch_card_id=?').run(customer.id, pc.id);
-      punchResults.push({ card: pc.name, reward: pc.reward, earned: true, punches: 0 });
+      punchResults.push({ card: pc.name, reward: pc.reward, earned: true, punches: 0, required: pc.visits_required });
     } else {
       db.prepare('UPDATE customer_punches SET punches=? WHERE customer_id=? AND punch_card_id=?').run(newPunches, customer.id, pc.id);
       punchResults.push({ card: pc.name, reward: pc.reward, earned: false, punches: newPunches, required: pc.visits_required });
     }
   });
+
   const updated = db.prepare('SELECT * FROM customers WHERE id=?').get(customer.id);
   res.json({ success: true, customer: updated, punch_cards: punchResults });
 });
@@ -254,7 +280,6 @@ app.post('/api/punch-cards', (req, res) => {
   if (!name || !reward) return res.status(400).json({ success: false, error: 'Name and reward required' });
   const result = db.prepare('INSERT INTO punch_cards (name, reward, visits_required, active) VALUES (?,?,?,1)').run(name, reward, visits_required||10);
   const card = db.prepare('SELECT * FROM punch_cards WHERE id=?').get(result.lastInsertRowid);
-  // Create entries for all existing customers
   const customers = db.prepare('SELECT id FROM customers').all();
   customers.forEach(c => { db.prepare('INSERT OR IGNORE INTO customer_punches (customer_id,punch_card_id,punches) VALUES (?,?,0)').run(c.id, card.id); });
   res.json({ success: true, punch_card: card });
@@ -318,7 +343,7 @@ app.post('/api/campaigns/:id/send', async (req, res) => {
   const customers = getOptedInCustomers(campaign.target);
   let sent = 0, failed = 0;
   for (const customer of customers) {
-    const result = await sendSMS('+1'+customer.phone, campaign.message);
+    const result = await sendSMS(twilioPhone(customer.phone), campaign.message);
     if (result.success) sent++; else failed++;
   }
   db.prepare('UPDATE campaigns SET status=?, sent_count=?, sent_at=datetime("now") WHERE id=?').run('sent', sent, campaign.id);
@@ -330,10 +355,9 @@ app.post('/api/campaigns/send-now', async (req, res) => {
   if (!message) return res.status(400).json({ success: false, error: 'Message required' });
   const customers = getOptedInCustomers(target||'all');
   let sent = 0, failed = 0;
-  // Save campaign first
   const result = db.prepare('INSERT INTO campaigns (title,type,message,target,status,sent_at) VALUES (?,?,?,?,?,datetime("now"))').run(title||'Campaign', type||'weekly_sale', message, target||'all', 'sent');
   for (const customer of customers) {
-    const r = await sendSMS('+1'+customer.phone, message);
+    const r = await sendSMS(twilioPhone(customer.phone), message);
     if (r.success) sent++; else failed++;
   }
   db.prepare('UPDATE campaigns SET sent_count=? WHERE id=?').run(sent, result.lastInsertRowid);
@@ -345,7 +369,10 @@ app.post('/api/flash', async (req, res) => {
   if (!message) return res.status(400).json({ success: false, error: 'Message required' });
   const customers = getOptedInCustomers(target||'all');
   let sent = 0;
-  for (const c of customers) { const r = await sendSMS('+1'+c.phone, message); if(r.success) sent++; }
+  for (const c of customers) {
+    const r = await sendSMS(twilioPhone(c.phone), message);
+    if (r.success) sent++;
+  }
   res.json({ success: true, sent, total: customers.length });
 });
 
@@ -372,7 +399,7 @@ app.post('/api/raffles/:id/send', async (req, res) => {
     const ticket = 'RZ'+Math.floor(Math.random()*9000+1000);
     db.prepare('INSERT INTO raffle_entries (raffle_id,customer_id,ticket_number) VALUES (?,?,?)').run(raffle.id, c.id, ticket);
     const msg = (raffle.message||'🎰 ¡RIFA en Razco Foods! You\'re entered to win {PRIZE}! Ticket: #{TICKET}. ¡Buena suerte! 🍀').replace('{PRIZE}',raffle.prize).replace('{TICKET}',ticket).replace('{DATE}',raffle.draw_date||'TBD');
-    const r = await sendSMS('+1'+c.phone, msg);
+    const r = await sendSMS(twilioPhone(c.phone), msg);
     if (r.success) sent++;
   }
   res.json({ success: true, sent, total: customers.length });
@@ -388,19 +415,33 @@ app.post('/api/raffles/:id/draw', (req, res) => {
 
 // ══════════════════════════════════════════════════════════════
 //  WEEKLY AD
+//  FIX 3: images stored as JSON array of {name, src} objects
+//  Manager pushes → backend saves → kiosk fetches on load + every 5 min
 // ══════════════════════════════════════════════════════════════
 app.get('/api/weekly-ad', (req, res) => {
   const ad = db.prepare('SELECT * FROM weekly_ad WHERE active=1 ORDER BY created_at DESC LIMIT 1').get();
   if (!ad) return res.json({ success: true, ad: null });
-  ad.images = JSON.parse(ad.images||'[]');
+  try {
+    ad.images = JSON.parse(ad.images || '[]');
+  } catch(e) {
+    ad.images = [];
+  }
   res.json({ success: true, ad });
 });
 
 app.post('/api/weekly-ad', (req, res) => {
   const { dates, images } = req.body;
+  if (!images || !Array.isArray(images)) {
+    return res.status(400).json({ success: false, error: 'images array required' });
+  }
+  // Deactivate all previous ads
   db.prepare('UPDATE weekly_ad SET active=0').run();
-  const result = db.prepare('INSERT INTO weekly_ad (dates, images, active) VALUES (?,?,1)').run(dates||'', JSON.stringify(images||[]));
-  res.json({ success: true, id: result.lastInsertRowid });
+  // Save new ad — images is array of {name, src}
+  const result = db.prepare('INSERT INTO weekly_ad (dates, images, active) VALUES (?,?,1)').run(
+    dates || '',
+    JSON.stringify(images)
+  );
+  res.json({ success: true, id: result.lastInsertRowid, count: images.length });
 });
 
 // ══════════════════════════════════════════════════════════════
@@ -475,30 +516,28 @@ app.post('/api/mystery', async (req, res) => {
     const code = 'MYS-'+Math.random().toString(36).substr(2,5).toUpperCase();
     db.prepare('INSERT INTO coupons (code,title,description,type,free_item,max_uses,used_count,tier_required) VALUES (?,?,?,?,?,1,0,"all")').run(code,'Mystery Reward for '+c.name,'Personalized mystery reward','free_item',prize,1);
     const msg = (message||'🎁 ¡Tu regalo misterioso de Razco Foods! Your prize: {PRIZE}! Code: {CODE}. Show at checkout today! ¡Ven y disfruta! 💚 Reply STOP').replace('{PRIZE}',prize).replace('{CODE}',code);
-    const r = await sendSMS('+1'+c.phone, msg);
+    const r = await sendSMS(twilioPhone(c.phone), msg);
     if (r.success) sent++;
   }
   res.json({ success: true, sent, total: customers.length });
 });
 
 // ── CRON JOBS ─────────────────────────────────────────────────
-// Monday 8am — weekly ad SMS
 cron.schedule('0 8 * * 1', async () => {
   const ad = db.prepare("SELECT * FROM weekly_ad WHERE active=1 ORDER BY created_at DESC LIMIT 1").get();
   if (!ad) return;
   const customers = db.prepare("SELECT * FROM customers WHERE opt_in_sms=1").all();
   for (const c of customers) {
-    await sendSMS('+1'+c.phone, `🛒 ¡Esta semana en Razco Foods! ${ad.dates}. ¡Ven y ahorra familia! 💚 Reply STOP`);
+    await sendSMS(twilioPhone(c.phone), `🛒 ¡Esta semana en Razco Foods! ${ad.dates}. ¡Ven y ahorra familia! 💚 Reply STOP`);
   }
 });
 
-// Sunday 9am — AI shopping lists
 cron.schedule('0 9 * * 0', async () => {
   const customers = db.prepare("SELECT * FROM customers WHERE opt_in_sms=1 AND visits>=2").all();
   for (const c of customers) {
     const r = await fetch(`http://localhost:${PORT}/api/ai/shopping-list`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({customer_id:c.id}) });
     const d = await r.json();
-    if (d.message) await sendSMS('+1'+c.phone, d.message);
+    if (d.message) await sendSMS(twilioPhone(c.phone), d.message);
   }
 });
 
